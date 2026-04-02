@@ -1,1 +1,0 @@
-Backend - Smart Hospital Surveillance and Safety Management System
