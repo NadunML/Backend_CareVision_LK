@@ -45,6 +45,60 @@ db_config = {
     'password': '',
     'database': 'carevision_db'
 }
+try:
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS access_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            camera_id VARCHAR(50),
+            mask_detected VARCHAR(10),
+            confidence VARCHAR(10),
+            access_result VARCHAR(20),
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS fire_logs (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            camera_id VARCHAR(50),
+            event_type VARCHAR(50),
+            confidence VARCHAR(10),
+            severity VARCHAR(20),
+            status VARCHAR(20) DEFAULT 'Active',
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    # අලුත් Alerts Table එක
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS system_alerts (
+            id INT AUTO_INCREMENT PRIMARY KEY,
+            alert_type VARCHAR(50),
+            description VARCHAR(255),
+            camera_id VARCHAR(50),
+            priority VARCHAR(20),
+            status VARCHAR(20) DEFAULT 'Pending',
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    cursor.execute("SELECT COUNT(*) FROM access_logs")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT INTO access_logs (camera_id, mask_detected, confidence, access_result) VALUES ('Cam 05', 'Yes', '98%', 'Granted'), ('Cam 04', 'No', '95%', 'Denied'), ('Cam 06', 'Yes', '92%', 'Granted')")
+    
+    cursor.execute("SELECT COUNT(*) FROM fire_logs")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT INTO fire_logs (camera_id, event_type, confidence, severity, status) VALUES ('Cam 07', 'Smoke Detected', '95%', 'High', 'Active'), ('Cam 08', 'Fire Detected', '88%', 'Critical', 'Resolved'), ('Cam 09', 'Smoke Detected', '76%', 'Medium', 'Resolved')")
+    
+    cursor.execute("SELECT COUNT(*) FROM system_alerts")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT INTO system_alerts (alert_type, description, camera_id, priority, status) VALUES ('Fire', 'Fire detected in Store Room', 'Cam 07', 'High', 'Pending'), ('Patient Wandering', 'Patient John Anderson detected at Exit', 'Cam 02', 'High', 'Pending'), ('Mask Violation', 'Staff entered ICU without proper mask', 'Cam 04', 'Medium', 'Pending')")
+
+    conn.commit()
+    cursor.close()
+    conn.close()
+except Exception as e:
+    print(f"DB Init Error: {e}")
 
 modes = {
     'patientIdent': False,
@@ -52,13 +106,14 @@ modes = {
     'fireDetect': False
 }
 
-# 🔥 කැමරා 9ක් සඳහා ඉඩ වෙන් කිරීම 🔥
 camera_urls = {str(i): '' for i in range(1, 10)}
 
 known_face_encodings = []
 known_face_names = []
 maskNet = None  
 fire_model = None 
+
+last_log_times = {}
 
 UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER):
@@ -138,6 +193,7 @@ class ThreadedCamera:
         self.capture.release()
 
 def generate_frames(cam_id):
+    global last_log_times
     url = camera_urls.get(cam_id, '')
     if not url:
         return
@@ -168,10 +224,9 @@ def generate_frames(cam_id):
             frame = frame.copy() 
             frame_counter += 1
             
-            if frame_counter % 4 == 0:
+            if frame_counter % 15 == 0:
                 small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
 
-                # 🔥 1. Patient Detection (Cameras 1, 2, 3) 🔥
                 if cam_id in ['1', '2', '3'] and modes['patientIdent']:
                     try:
                         rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
@@ -188,10 +243,28 @@ def generate_frames(cam_id):
                                 first_match_index = matches.index(True)
                                 name = known_face_names[first_match_index]
                             last_face_names.append(name)
+                            
+                            # 🔥 Patient Alert ලියන කෑල්ල 🔥
+                            if name != "Unknown":
+                                current_time = time.time()
+                                alert_key = f"pat_{cam_id}_{name}"
+                                if current_time - last_log_times.get(alert_key, 0) > 20: 
+                                    try:
+                                        db_conn = mysql.connector.connect(**db_config)
+                                        db_cursor = db_conn.cursor()
+                                        db_cursor.execute(
+                                            "INSERT INTO system_alerts (alert_type, description, camera_id, priority) VALUES (%s, %s, %s, %s)",
+                                            ('Patient Wandering', f'Patient {name} detected at unauthorized zone', f"Cam 0{cam_id}", 'High')
+                                        )
+                                        db_conn.commit()
+                                        db_cursor.close()
+                                        db_conn.close()
+                                        last_log_times[alert_key] = current_time
+                                    except Exception:
+                                        pass
                     except Exception:
                         pass
 
-                # 🔥 2. Mask Detection (Cameras 4, 5, 6) 🔥
                 elif cam_id in ['4', '5', '6'] and modes['maskDetect']:
                     try:
                         gray_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
@@ -200,9 +273,7 @@ def generate_frames(cam_id):
                         temp_mask_status = []
                         for (x, y, w, h) in faces:
                             orig_x, orig_y, orig_w, orig_h = x * 4, y * 4, w * 4, h * 4
-                            
-                            if w < 20 or h < 20:
-                                continue
+                            if w < 20 or h < 20: continue
 
                             if maskNet is not None:
                                 face_img = small_frame[y:y+h, x:x+w]
@@ -212,30 +283,39 @@ def generate_frames(cam_id):
                                     face_img = img_to_array(face_img)
                                     face_img = preprocess_input(face_img)
                                     face_img = np.expand_dims(face_img, axis=0)
-                                    
                                     predictions = maskNet.predict(face_img, verbose=0)[0]
-                                    mask_prob = predictions[0]
-                                    without_mask_prob = predictions[1]
-                                    
+                                    mask_prob, without_mask_prob = predictions[0], predictions[1]
                                     no_mask = without_mask_prob > mask_prob
-                                else:
-                                    no_mask = True
-                            else:
-                                no_mask = True 
-                                
+                                    conf_val = f"{int(max(mask_prob, without_mask_prob) * 100)}%"
+                                    
+                                    current_time = time.time()
+                                    if current_time - last_log_times.get(cam_id, 0) > 10: 
+                                        mask_det_str = "No" if no_mask else "Yes"
+                                        acc_res_str = "Denied" if no_mask else "Granted"
+                                        try:
+                                            db_conn = mysql.connector.connect(**db_config)
+                                            db_cursor = db_conn.cursor()
+                                            db_cursor.execute("INSERT INTO access_logs (camera_id, mask_detected, confidence, access_result) VALUES (%s, %s, %s, %s)", (f"Cam 0{cam_id}", mask_det_str, conf_val, acc_res_str))
+                                            if no_mask:
+                                                db_cursor.execute("INSERT INTO system_alerts (alert_type, description, camera_id, priority) VALUES (%s, %s, %s, %s)", ('Mask Violation', 'Staff entered zone without proper mask', f"Cam 0{cam_id}", 'Medium'))
+                                            db_conn.commit()
+                                            db_cursor.close()
+                                            db_conn.close()
+                                            last_log_times[cam_id] = current_time
+                                        except Exception:
+                                            pass
+                                else: no_mask = True
+                            else: no_mask = True 
                             temp_mask_status.append((orig_x, orig_y, orig_w, orig_h, no_mask))
-                                
                         last_mask_status = temp_mask_status
                     except Exception:
                         pass
 
-                # 🔥 3. Fire Detection (Cameras 7, 8, 9) 🔥
                 elif cam_id in ['7', '8', '9'] and modes['fireDetect']:
                     try:
                         temp_fire_status = []
                         if fire_model is not None:
                             results = fire_model(small_frame, verbose=False)
-                            
                             for r in results:
                                 boxes = r.boxes
                                 for box in boxes:
@@ -243,17 +323,33 @@ def generate_frames(cam_id):
                                     cls_id = int(box.cls[0])
                                     class_name = fire_model.names[cls_id].upper() 
                                     
-                                    # Threshold එක 0.35 කරලා තියෙන්නේ Flickering අඩු කරන්න
                                     if 'FIRE' in class_name and conf > 0.35:
                                         x1, y1, x2, y2 = map(int, box.xyxy[0])
                                         orig_x1, orig_y1, orig_x2, orig_y2 = x1 * 4, y1 * 4, x2 * 4, y2 * 4
                                         temp_fire_status.append((orig_x1, orig_y1, orig_x2, orig_y2, conf, class_name))
                                         
+                                        current_time = time.time()
+                                        fire_log_key = f"fire_{cam_id}"
+                                        if current_time - last_log_times.get(fire_log_key, 0) > 15: 
+                                            event_type = "Fire Detected" if 'FIRE' in class_name else "Smoke Detected"
+                                            severity = "Critical" if conf > 0.65 else "High"
+                                            conf_val = f"{int(conf * 100)}%"
+                                            try:
+                                                db_conn = mysql.connector.connect(**db_config)
+                                                db_cursor = db_conn.cursor()
+                                                db_cursor.execute("INSERT INTO fire_logs (camera_id, event_type, confidence, severity, status) VALUES (%s, %s, %s, %s, 'Active')", (f"Cam 0{cam_id}", event_type, conf_val, severity))
+                                                # 🔥 Fire Alert ලියන කෑල්ල 🔥
+                                                db_cursor.execute("INSERT INTO system_alerts (alert_type, description, camera_id, priority) VALUES (%s, %s, %s, %s)", ('Fire', f'{event_type} in Danger Zone', f"Cam 0{cam_id}", 'High'))
+                                                db_conn.commit()
+                                                db_cursor.close()
+                                                db_conn.close()
+                                                last_log_times[fire_log_key] = current_time
+                                            except Exception:
+                                                pass
                         last_fire_status = temp_fire_status
                     except Exception:
                         pass
 
-            # Drawing Bounding Boxes
             if cam_id in ['1', '2', '3'] and modes['patientIdent']:
                 for (top, right, bottom, left), name in zip(last_face_locations, last_face_names):
                     top *= 4; right *= 4; bottom *= 4; left *= 4
@@ -285,14 +381,11 @@ def generate_frames(cam_id):
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             
-            time.sleep(0.03)
+            time.sleep(0.01)
 
     finally:
         camera.stop() 
 
-# ========================================================
-# API Endpoints
-# ========================================================
 @app.get("/")
 async def root():
     return {"status": "Backend & AI Operational"}
@@ -371,18 +464,86 @@ async def delete_patient(patient_id: str):
     try:
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor()
-        
         cursor.execute("DELETE FROM patients WHERE patient_id = %s", (patient_id,))
         conn.commit()
-        
         cursor.close()
         conn.close()
-
         load_ai_models() 
-        
         return {"status": "success", "message": "Patient deleted successfully!"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/access_logs")
+async def get_access_logs():
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True) 
+        cursor.execute("SELECT camera_id, mask_detected, confidence, access_result, timestamp FROM access_logs ORDER BY timestamp DESC LIMIT 50")
+        logs = cursor.fetchall()
+        for log in logs:
+            log['timestamp'] = str(log['timestamp'])
+        cursor.close()
+        conn.close()
+        return logs
+    except Exception as e:
+        return []
+
+@app.get("/api/fire_logs")
+async def get_fire_logs():
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True) 
+        cursor.execute("SELECT id, camera_id, event_type, confidence, severity, status, timestamp FROM fire_logs ORDER BY timestamp DESC LIMIT 50")
+        logs = cursor.fetchall()
+        for log in logs:
+            log['timestamp'] = str(log['timestamp'])
+        cursor.close()
+        conn.close()
+        return logs
+    except Exception as e:
+        return []
+
+@app.post("/api/resolve_fire_alert/{log_id}")
+async def resolve_fire_alert(log_id: int):
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE fire_logs SET status = 'Resolved' WHERE id = %s", (log_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error"}
+
+# 🔥 Alerts Page එකට අදාළ අලුත් API Endpoints 🔥
+@app.get("/api/system_alerts")
+async def get_system_alerts():
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True) 
+        cursor.execute("SELECT id, alert_type, description, camera_id, priority, status, timestamp FROM system_alerts ORDER BY timestamp DESC LIMIT 50")
+        logs = cursor.fetchall()
+        for log in logs:
+            log['timestamp'] = str(log['timestamp'])
+        cursor.close()
+        conn.close()
+        return logs
+    except Exception as e:
+        return []
+
+@app.post("/api/resolve_system_alert/{alert_id}")
+async def resolve_system_alert(alert_id: int):
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE system_alerts SET status = 'Resolved' WHERE id = %s", (alert_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error"}
 
 if __name__ == "__main__":
     import uvicorn
