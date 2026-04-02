@@ -21,8 +21,3 @@ The backend seamlessly orchestrates three distinct AI models to ensure hospital 
 * Python 3.9+
 * MySQL Server running locally
 * A compatible C++ compiler (required for `dlib` / `face_recognition` building)
-
-### 1. Install Dependencies
-Clone the repository and install the required Python packages:
-```bash
-pip install -r requirements.txt
