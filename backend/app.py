@@ -69,7 +69,7 @@ try:
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # අලුත් Alerts Table එක
+    # Alerts Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_alerts (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -244,7 +244,7 @@ def generate_frames(cam_id):
                                 name = known_face_names[first_match_index]
                             last_face_names.append(name)
                             
-                            # 🔥 Patient Alert ලියන කෑල්ල 🔥
+                            # 🔥Patient Alert🔥
                             if name != "Unknown":
                                 current_time = time.time()
                                 alert_key = f"pat_{cam_id}_{name}"
@@ -516,7 +516,7 @@ async def resolve_fire_alert(log_id: int):
     except Exception as e:
         return {"status": "error"}
 
-# 🔥 Alerts Page එකට අදාළ අලුත් API Endpoints 🔥
+# Alerts Page API Endpoints 
 @app.get("/api/system_alerts")
 async def get_system_alerts():
     try:
