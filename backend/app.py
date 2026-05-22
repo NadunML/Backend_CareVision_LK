@@ -1,6 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 import mysql.connector
 import cv2
 import numpy as np
@@ -9,7 +10,6 @@ import face_recognition
 from werkzeug.utils import secure_filename
 import threading
 import time
-
 from ultralytics import YOLO 
 
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
@@ -45,6 +45,7 @@ db_config = {
     'password': '',
     'database': 'carevision_db'
 }
+
 try:
     conn = mysql.connector.connect(**db_config)
     cursor = conn.cursor()
@@ -69,7 +70,6 @@ try:
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
-    # Alerts Table
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS system_alerts (
             id INT AUTO_INCREMENT PRIMARY KEY,
@@ -82,17 +82,18 @@ try:
         )
     """)
     
+    # Updated default dummy data to match Cam 01 - 05
     cursor.execute("SELECT COUNT(*) FROM access_logs")
     if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO access_logs (camera_id, mask_detected, confidence, access_result) VALUES ('Cam 05', 'Yes', '98%', 'Granted'), ('Cam 04', 'No', '95%', 'Denied'), ('Cam 06', 'Yes', '92%', 'Granted')")
+        cursor.execute("INSERT INTO access_logs (camera_id, mask_detected, confidence, access_result) VALUES ('Cam 05', 'Yes', '98%', 'Granted'), ('Cam 04', 'No', '95%', 'Denied'), ('Cam 02', 'Yes', '92%', 'Granted')")
     
     cursor.execute("SELECT COUNT(*) FROM fire_logs")
     if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO fire_logs (camera_id, event_type, confidence, severity, status) VALUES ('Cam 07', 'Smoke Detected', '95%', 'High', 'Active'), ('Cam 08', 'Fire Detected', '88%', 'Critical', 'Resolved'), ('Cam 09', 'Smoke Detected', '76%', 'Medium', 'Resolved')")
+        cursor.execute("INSERT INTO fire_logs (camera_id, event_type, confidence, severity, status) VALUES ('Cam 01', 'Smoke Detected', '95%', 'High', 'Active'), ('Cam 03', 'Fire Detected', '88%', 'Critical', 'Resolved')")
     
     cursor.execute("SELECT COUNT(*) FROM system_alerts")
     if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO system_alerts (alert_type, description, camera_id, priority, status) VALUES ('Fire', 'Fire detected in Store Room', 'Cam 07', 'High', 'Pending'), ('Patient Wandering', 'Patient John Anderson detected at Exit', 'Cam 02', 'High', 'Pending'), ('Mask Violation', 'Staff entered ICU without proper mask', 'Cam 04', 'Medium', 'Pending')")
+        cursor.execute("INSERT INTO system_alerts (alert_type, description, camera_id, priority, status) VALUES ('Fire', 'Fire detected in Store Room', 'Cam 01', 'High', 'Pending'), ('Patient Wandering', 'Patient John Anderson detected at Exit', 'Cam 02', 'High', 'Pending'), ('Mask Violation', 'Staff entered ICU without proper mask', 'Cam 04', 'Medium', 'Pending')")
 
     conn.commit()
     cursor.close()
@@ -100,13 +101,13 @@ try:
 except Exception as e:
     print(f"DB Init Error: {e}")
 
-modes = {
-    'patientIdent': False,
-    'maskDetect': False,
-    'fireDetect': False
+# NEW: Nested config for 5 cameras, replacing the old global 'modes'
+camera_ai_configs = {
+    str(i): {'patient': False, 'mask': False, 'fire': False} for i in range(1, 6)
 }
 
-camera_urls = {str(i): '' for i in range(1, 10)}
+# Adjusted to 5 cameras
+camera_urls = {str(i): '' for i in range(1, 6)}
 
 known_face_encodings = []
 known_face_names = []
@@ -224,10 +225,14 @@ def generate_frames(cam_id):
             frame = frame.copy() 
             frame_counter += 1
             
+            # Fetch the specific AI configuration for this camera
+            cam_config = camera_ai_configs.get(cam_id, {'patient': False, 'mask': False, 'fire': False})
+            
             if frame_counter % 15 == 0:
                 small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
 
-                if cam_id in ['1', '2', '3'] and modes['patientIdent']:
+                # Patient Detection Logic
+                if cam_config['patient']:
                     try:
                         rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
                         final_ai_frame = np.array(rgb_small_frame, dtype=np.uint8).copy()
@@ -244,7 +249,6 @@ def generate_frames(cam_id):
                                 name = known_face_names[first_match_index]
                             last_face_names.append(name)
                             
-                            # 🔥Patient Alert🔥
                             if name != "Unknown":
                                 current_time = time.time()
                                 alert_key = f"pat_{cam_id}_{name}"
@@ -265,7 +269,8 @@ def generate_frames(cam_id):
                     except Exception:
                         pass
 
-                elif cam_id in ['4', '5', '6'] and modes['maskDetect']:
+                # Mask Detection Logic
+                if cam_config['mask']:
                     try:
                         gray_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
                         faces = face_cascade.detectMultiScale(gray_small, 1.1, 4)
@@ -304,14 +309,14 @@ def generate_frames(cam_id):
                                             last_log_times[cam_id] = current_time
                                         except Exception:
                                             pass
-                                else: no_mask = True
                             else: no_mask = True 
                             temp_mask_status.append((orig_x, orig_y, orig_w, orig_h, no_mask))
                         last_mask_status = temp_mask_status
                     except Exception:
                         pass
 
-                elif cam_id in ['7', '8', '9'] and modes['fireDetect']:
+                # Fire Detection Logic
+                if cam_config['fire']:
                     try:
                         temp_fire_status = []
                         if fire_model is not None:
@@ -338,7 +343,6 @@ def generate_frames(cam_id):
                                                 db_conn = mysql.connector.connect(**db_config)
                                                 db_cursor = db_conn.cursor()
                                                 db_cursor.execute("INSERT INTO fire_logs (camera_id, event_type, confidence, severity, status) VALUES (%s, %s, %s, %s, 'Active')", (f"Cam 0{cam_id}", event_type, conf_val, severity))
-                                                # 🔥 Fire Alert ලියන කෑල්ල 🔥
                                                 db_cursor.execute("INSERT INTO system_alerts (alert_type, description, camera_id, priority) VALUES (%s, %s, %s, %s)", ('Fire', f'{event_type} in Danger Zone', f"Cam 0{cam_id}", 'High'))
                                                 db_conn.commit()
                                                 db_cursor.close()
@@ -350,7 +354,8 @@ def generate_frames(cam_id):
                     except Exception:
                         pass
 
-            if cam_id in ['1', '2', '3'] and modes['patientIdent']:
+            # Drawing Overlays on the Frame
+            if cam_config['patient']:
                 for (top, right, bottom, left), name in zip(last_face_locations, last_face_names):
                     top *= 4; right *= 4; bottom *= 4; left *= 4
                     if name != "Unknown":
@@ -360,7 +365,7 @@ def generate_frames(cam_id):
                         cv2.rectangle(frame, (left, top), (right, bottom), (0, 255, 0), 2)
                         cv2.putText(frame, "Staff", (left + 6, bottom - 6), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 0), 1)
 
-            elif cam_id in ['4', '5', '6'] and modes['maskDetect']:
+            if cam_config['mask']:
                 for (x, y, w, h, no_mask) in last_mask_status:
                     if no_mask:
                         cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 0, 255), 3) 
@@ -369,7 +374,7 @@ def generate_frames(cam_id):
                         cv2.rectangle(frame, (x, y), (x+w, y+h), (0, 255, 0), 2) 
                         cv2.putText(frame, 'Mask Detected', (x, y - 10), cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 255, 0), 2)
             
-            elif cam_id in ['7', '8', '9'] and modes['fireDetect']:
+            if cam_config['fire']:
                 if len(last_fire_status) > 0:
                     cv2.putText(frame, 'EMERGENCY: FIRE DETECTED!', (20, 50), cv2.FONT_HERSHEY_DUPLEX, 1.0, (0, 0, 255), 2)
                     for (x1, y1, x2, y2, conf, class_name) in last_fire_status:
@@ -386,6 +391,14 @@ def generate_frames(cam_id):
     finally:
         camera.stop() 
 
+
+# --- API Models and Endpoints ---
+
+class AIConfigUpdate(BaseModel):
+    camId: str
+    module: str
+    status: bool
+
 @app.get("/")
 async def root():
     return {"status": "Backend & AI Operational"}
@@ -394,17 +407,19 @@ async def root():
 async def video_feed(cam_id: str):
     return StreamingResponse(generate_frames(cam_id), media_type="multipart/x-mixed-replace; boundary=frame")
 
+# NEW: Update AI settings for a specific camera
+@app.post("/api/set_camera_ai")
+async def set_camera_ai(config: AIConfigUpdate):
+    global camera_ai_configs
+    if config.camId in camera_ai_configs and config.module in camera_ai_configs[config.camId]:
+        camera_ai_configs[config.camId][config.module] = config.status
+        return {"status": "success", "configs": camera_ai_configs}
+    return {"status": "error"}
+
+# Kept for legacy dashboard compatibility
 @app.get("/api/get_modes")
 async def get_modes():
-    return modes
-
-@app.post("/toggle_mode/{mode}")
-async def toggle_mode(mode: str):
-    global modes
-    if mode in modes:
-        modes[mode] = not modes[mode]
-        return {"status": "success", "modes": modes}
-    return {"status": "error"}
+    return camera_ai_configs.get('1', {})
 
 @app.post("/api/update_camera")
 async def update_camera(cam_id: str = Form(...), url: str = Form(default="")):
@@ -516,7 +531,6 @@ async def resolve_fire_alert(log_id: int):
     except Exception as e:
         return {"status": "error"}
 
-# Alerts Page API Endpoints 
 @app.get("/api/system_alerts")
 async def get_system_alerts():
     try:
