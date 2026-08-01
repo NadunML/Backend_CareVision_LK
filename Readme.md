@@ -1,23 +1,71 @@
-# 🧠 CareVision LK - Edge AI Backend Server
+# CareVision LK - Edge AI Backend Server
 
-This repository contains the core Python/FastAPI backend that powers the CareVision LK Intelligent Hospital Security System. It acts as the central Edge Node, processing multiple live video streams and executing complex Deep Learning models in real-time without cloud-processing latency.
+This repository contains the core Python/FastAPI backend for the CareVision LK Hospital Security System. It acts as the central edge node, processing multiple live video streams and running machine learning models locally in real-time.
 
-## ⚙️ Core Architecture & Technologies
+## Core Architecture
 
-* **Framework:** **FastAPI** (Python) for high-performance, asynchronous API routing and live video stream broadcasting.
-* **Computer Vision:** **OpenCV** with custom `ThreadedCamera` processing to handle multiple RTSP/HTTP IP camera feeds simultaneously without frame-blocking.
-* **Database:** **MySQL** via `mysql-connector-python` for secure, structured logging of security events, access control requests, and registered patient data.
+* **Framework:** FastAPI for high-performance, asynchronous API routing and live video stream broadcasting (MJPEG).
+* **Video Processing:** OpenCV with a custom `ThreadedCamera` implementation to handle multiple RTSP/HTTP IP camera feeds concurrently without frame-blocking.
+* **Database:** MySQL (via `mysql-connector-python`) for structured logging of security events, access logs, and patient records.
 
-## 🤖 AI Inference Engine
+## Key Features & AI Models
 
-The backend seamlessly orchestrates three distinct AI models to ensure hospital safety:
-1. **Fire & Hazard Detection:** Powered by **YOLOv8** (Ultralytics) for instantaneous, dynamic threat recognition in critical zones.
-2. **PPE / Mask Compliance:** Powered by a lightweight **MobileNetV2** (TensorFlow/Keras) CNN architecture optimized for rapid frame-by-frame analysis.
-3. **Patient Identification:** Powered by **face_recognition** (dlib) utilizing 68 facial landmarks for high-accuracy tracking of high-risk patients.
+The backend runs three primary AI modules to ensure hospital safety:
 
-## 🛠️ Local Setup & Installation
+1. **Fire Detection & Emergency Lockdown (YOLOv8):** 
+   Monitors critical zones for fire and smoke. If a fire is detected, the system triggers a global emergency lockdown, automatically pausing non-essential AI modules to allocate all processing power to the emergency response.
+
+2. **Patient Wandering Detection (dlib / face_recognition):** 
+   Utilizes facial landmarks to identify registered high-risk patients across active camera feeds. Triggers immediate alerts if a patient wanders into unauthorized or unsafe areas.
+
+3. **Mask Compliance Monitoring (MobileNetV2 / Keras):** 
+   A lightweight CNN that analyzes faces frame-by-frame to enforce PPE compliance at ward access points.
+
+4. **Edge Security & Resource Management:** 
+   Features a secure teardown process. When an admin logs out from the frontend, the backend automatically terminates all active camera connections and clears stream URLs from memory to prevent unauthorized viewing.
+
+## Local Setup & Installation
 
 ### Prerequisites
-* Python 3.9+
+
+* Python 3.9 or higher
 * MySQL Server running locally
-* A compatible C++ compiler (required for `dlib` / `face_recognition` building)
+* A compatible C++ compiler (required for building `dlib` / `face_recognition`)
+
+### Setup Instructions
+
+1. **Clone the repository and navigate to the backend directory.**
+
+2. **Create and activate a virtual environment:**
+    ```bash
+    python -m venv venv
+    # On Windows use: venv\Scripts\activate
+    source venv/bin/activate
+    ```
+
+3. **Install dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4. **Configure the Environment:**
+    Create a `.env` file in the root directory and add your MySQL database credentials:
+    ```env
+    DB_HOST=localhost
+    DB_USER=root
+    DB_PASSWORD=your_password
+    DB_NAME=carevision_db
+    ```
+
+5. **Download Pre-trained Models:**
+    Run the utility scripts to fetch the required AI models:
+    ```bash
+    python download_fire_model.py
+    python download_mask_model.py
+    ```
+
+6. **Start the Backend Server:**
+    ```bash
+    python main.py
+    ```
+    *(Note: The FastAPI backend runs on `http://localhost:5000`. Ensure your React frontend is configured to communicate with this port, while the frontend itself typically runs on `http://localhost:5173`.)*
