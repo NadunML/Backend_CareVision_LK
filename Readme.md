@@ -37,4 +37,35 @@ The backend runs three primary AI modules to ensure hospital safety:
 1. **Clone the repository and navigate to the backend directory.**
 
 2. **Create and activate a virtual environment:**
+   ```bash
+   python -m venv venv
+   # On Windows use: venv\Scripts\activate
+   source venv/bin/activate
+   ```
 
+3. **Install dependencies:**
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Configure the Environment:**
+   Create a `.env` file in the root directory and add your MySQL database credentials:
+   ```env
+   DB_HOST=localhost
+   DB_USER=root
+   DB_PASSWORD=your_password
+   DB_NAME=carevision_db
+   ```
+
+5. **Download Pre-trained Models:**
+   Run the utility scripts to fetch the required AI models:
+   ```bash
+   python download_fire_model.py
+   python download_mask_model.py
+   ```
+
+6. **Start the Backend Server:**
+   ```bash
+   python main.py
+   ```
+   *(Note: The FastAPI backend runs on `http://localhost:5000`. Ensure your React frontend is configured to communicate with this port, while the frontend itself typically runs on `http://localhost:5173`.)*
