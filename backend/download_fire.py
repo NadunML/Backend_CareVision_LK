@@ -1,33 +1,50 @@
-# CareVision LK - Model Downloader
-# Downloads the pre-trained YOLOv8 model for fire detection
+"""
+CareVision LK - Edge AI Backend
+Utility script to fetch and verify the YOLOv8 Fire Detection Model.
+Author: Shiwon Sachintha
+"""
 
 import urllib.request
 import urllib.error
 import sys
+import logging
 
-def download_fire_model():
-    print("Starting download for YOLOv8 model...")
-    
-    url = "https://github.com/nimradev064/Real-Time-Fire-Detection-Flask-App/raw/main/Models/best.pt"
-    output_filename = "fire_model.pt"
+# Configure professional logging for the backend
+logging.basicConfig(
+    level=logging.INFO,
+    format='[%(asctime)s] %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
 
-    # Add User-Agent to avoid 403 Forbidden errors
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+def fetch_fire_detection_model() -> None:
+    """
+    Downloads the pre-trained YOLOv8 weights required for the fire detection 
+    module. Implements custom headers to bypass restrictive firewalls.
+    """
+    model_url = "https://github.com/nimradev064/Real-Time-Fire-Detection-Flask-App/raw/main/Models/best.pt"
+    output_path = "fire_model.pt"
+
+    logging.info("Initializing download sequence for YOLOv8 Fire Detection Model...")
+
+    # Implement User-Agent to prevent HTTP 403 Forbidden responses
+    request_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    req = urllib.request.Request(model_url, headers=request_headers)
 
     try:
-        with urllib.request.urlopen(req) as response, open(output_filename, 'wb') as out_file:
-            print(f"Downloading to '{output_filename}'...")
-            data = response.read()
-            out_file.write(data)
+        logging.info("Establishing connection to remote repository...")
+        with urllib.request.urlopen(req) as response, open(output_path, 'wb') as out_file:
+            logging.info(f"Downloading stream to '{output_path}'. This may take a moment...")
+            file_data = response.read()
+            out_file.write(file_data)
             
-        print(f"Download complete: {output_filename}")
+        logging.info(f"Successfully retrieved and saved model to: {output_path}")
         
-    except urllib.error.URLError as e:
-        print(f"Network error while downloading: {e}")
+    except urllib.error.URLError as network_error:
+        logging.error(f"Network exception encountered during download: {network_error}")
         sys.exit(1)
-    except Exception as e:
-        print(f"Unexpected error: {e}")
+    except Exception as critical_error:
+        logging.critical(f"Unexpected system error occurred: {critical_error}")
         sys.exit(1)
 
 if __name__ == "__main__":
-    download_fire_model()
+    fetch_fire_detection_model()
