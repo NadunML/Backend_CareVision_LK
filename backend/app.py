@@ -3,12 +3,12 @@ CareVision LK - Backend API Server
 ====================================
 FastAPI-based backend providing real-time AI surveillance capabilities
 including patient wandering detection, mask compliance monitoring,
-fire/smoke detection, and patient registration management.
+fire detection, and patient registration management.
 
 AI Models:
     - Face Recognition (dlib): Patient identification
     - MobileNetV2 (TensorFlow/Keras): Mask detection
-    - YOLOv8 (Ultralytics): Fire and smoke detection
+    - YOLOv8 (Ultralytics): Fire detection
 
 Database credentials are loaded from a .env file via python-dotenv.
 """
@@ -84,80 +84,13 @@ db_config = {
     'database': os.getenv('DB_NAME', 'carevision_db')
 }
 
+# Industry Standard: Validate connection instead of auto-creating schema at runtime
 try:
-    # First connect without specifying database to create DB if missing
-    conn_init = mysql.connector.connect(
-        host=db_config['host'],
-        user=db_config['user'],
-        password=db_config['password']
-    )
-    cursor_init = conn_init.cursor()
-    cursor_init.execute("CREATE DATABASE IF NOT EXISTS carevision_db")
-    cursor_init.close()
-    conn_init.close()
-
     conn = mysql.connector.connect(**db_config)
-    cursor = conn.cursor()
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS patients (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            patient_id VARCHAR(50) UNIQUE,
-            name VARCHAR(100),
-            ward VARCHAR(50),
-            ward_id VARCHAR(50),
-            image_path VARCHAR(255),
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS access_logs (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            camera_id VARCHAR(50),
-            mask_detected VARCHAR(10),
-            access_result VARCHAR(20),
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS fire_logs (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            camera_id VARCHAR(50),
-            event_type VARCHAR(50),
-            status VARCHAR(20) DEFAULT 'Active',
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS system_alerts (
-            id INT AUTO_INCREMENT PRIMARY KEY,
-            alert_type VARCHAR(50),
-            camera_id VARCHAR(50),
-            status VARCHAR(20) DEFAULT 'Pending',
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    
-    cursor.execute("SELECT COUNT(*) FROM access_logs")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO access_logs (camera_id, mask_detected, access_result) VALUES ('Cam 05', 'Yes', 'Granted'), ('Cam 04', 'No', 'Denied'), ('Cam 02', 'Yes', 'Granted')")
-    
-    cursor.execute("SELECT COUNT(*) FROM fire_logs")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO fire_logs (camera_id, event_type, status) VALUES ('Cam 01', 'Smoke Detected', 'Resolved'), ('Cam 03', 'Fire Detected', 'Resolved')")
-    
-    cursor.execute("SELECT COUNT(*) FROM system_alerts")
-    if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO system_alerts (alert_type, camera_id, status) VALUES ('Fire', 'Cam 01', 'Resolved'), ('Patient Wandering', 'Cam 02', 'Pending'), ('Mask Violation', 'Cam 04', 'Pending')")
-
-    cursor.execute("UPDATE fire_logs SET status = 'Resolved' WHERE status = 'Active'")
-    cursor.execute("UPDATE system_alerts SET status = 'Resolved' WHERE alert_type = 'Fire' AND status = 'Pending'")
-
-    conn.commit()
-    cursor.close()
     conn.close()
-    print("✅ Database initialized successfully!")
+    print("✅ Successfully connected to the database!")
 except Exception as e:
-    print(f"DB Init Error: {e}")
+    print(f"❌ Database Connection Error: {e}")
 
 camera_ai_configs = {
     str(i): {'patient': False, 'mask': False, 'fire': False} for i in range(1, 6)
@@ -405,7 +338,7 @@ def generate_frames(cam_id):
          placeholder frame if not.
       2. Reads the latest frame from the shared ThreadedCamera instance,
          serving a 'CONNECTING' placeholder on failure.
-      3. Every 5 frames: runs hybrid YOLOv8 + HSV fire/smoke detection.
+      3. Every 5 frames: runs hybrid YOLOv8 + HSV fire detection.
       4. Every 30 frames: runs face recognition (patient ID) and
          MobileNetV2 mask compliance detection.
       5. Draws bounding-box overlays and alert banners onto the frame.
@@ -511,8 +444,9 @@ def generate_frames(cam_id):
                                 cls_id = int(box.cls[0])
                                 class_name = fire_model.names[cls_id].upper()
 
-                                # Balance 1: Confidence > 65%
-                                if ('FIRE' in class_name or 'SMOKE' in class_name) and conf > 0.65:
+                                # Balance 1: Only process FIRE detections with confidence > 65%
+                                # SMOKE detections are explicitly ignored (filtered out).
+                                if 'FIRE' in class_name and 'SMOKE' not in class_name and conf > 0.65:
                                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                                     
                                     roi = small_frame_fire[y1:y2, x1:x2]
@@ -542,14 +476,12 @@ def generate_frames(cam_id):
                         current_time = time.time()
                         fire_log_key = f"fire_{cam_id}"
                         if current_time - last_log_times.get(fire_log_key, 0) > 10:
-                            best = max(temp_fire_status, key=lambda x: x[4])
-                            event_type = "Fire Detected" if 'FIRE' in best[5] else "Smoke Detected"
                             try:
                                 db_conn = mysql.connector.connect(**db_config)
                                 db_cursor = db_conn.cursor()
                                 db_cursor.execute(
-                                    "INSERT INTO fire_logs (camera_id, event_type, status) VALUES (%s, %s, 'Active')",
-                                    (f"Cam 0{cam_id}", event_type)
+                                    "INSERT INTO fire_logs (camera_id, status) VALUES (%s, 'Active')",
+                                    (f"Cam 0{cam_id}",)
                                 )
                                 db_cursor.execute(
                                     "INSERT INTO system_alerts (alert_type, camera_id) VALUES (%s, %s)",
@@ -880,11 +812,15 @@ async def get_access_logs():
 
 @app.get("/api/fire_logs")
 async def get_fire_logs():
-    """Return the 50 most recent fire/smoke detection log entries, newest first."""
+    """Return the 50 most recent fire detection log entries, newest first."""
     try:
         conn = mysql.connector.connect(**db_config)
-        cursor = conn.cursor(dictionary=True) 
-        cursor.execute("SELECT id, camera_id, event_type, status, timestamp FROM fire_logs ORDER BY timestamp DESC LIMIT 50")
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, camera_id, status, timestamp "
+            "FROM fire_logs "
+            "ORDER BY timestamp DESC LIMIT 50"
+        )
         logs = cursor.fetchall()
         for log in logs:
             log['timestamp'] = str(log['timestamp'])
