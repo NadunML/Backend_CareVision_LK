@@ -93,12 +93,12 @@ except Exception as e:
     print(f"❌ Database Connection Error: {e}")
 
 camera_ai_configs = {
-    str(i): {'patient': False, 'mask': False, 'fire': False} for i in range(1, 6)
+    str(i): {'patient': False, 'mask': False, 'fire': False} for i in range(1, 10)
 }
 
 fire_emergency_active = False
 
-camera_urls = {'1': '0', '2': '', '3': '', '4': '', '5': ''}
+camera_urls = {'1': '0', '2': '', '3': '', '4': '', '5': '', '6': '', '7': '', '8': '', '9': ''}
 
 known_face_encodings = []
 known_face_names = []
