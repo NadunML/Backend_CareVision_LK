@@ -428,7 +428,7 @@ def generate_frames(cam_id):
             scale = w / max(target_w, 1)
             
             # -------------------------------------------------------------
-            # 1. HYBRID FIRE DETECTION LOGIC (BALANCED SENSITIVITY)
+            # 1. HYBRID FIRE DETECTION LOGIC (HIGH SENSITIVITY)
             # -------------------------------------------------------------
             if cam_config['fire'] and frame_counter % 5 == 0:
                 small_frame_fire = cv2.resize(frame, (target_w, int(h / max(scale, 1e-6))))
@@ -444,9 +444,8 @@ def generate_frames(cam_id):
                                 cls_id = int(box.cls[0])
                                 class_name = fire_model.names[cls_id].upper()
 
-                                # Balance 1: Only process FIRE detections with confidence > 65%
-                                # SMOKE detections are explicitly ignored (filtered out).
-                                if 'FIRE' in class_name and 'SMOKE' not in class_name and conf > 0.65:
+                                # Balance 1: Confidence > 45% (More sensitive, lowered from 65%)
+                                if 'FIRE' in class_name and 'SMOKE' not in class_name and conf > 0.45:
                                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                                     
                                     roi = small_frame_fire[y1:y2, x1:x2]
@@ -458,8 +457,8 @@ def generate_frames(cam_id):
                                         
                                         fire_pixel_ratio = np.sum(mask > 0) / (roi.size / 3 + 1e-6)
                                         
-                                        # Balance 2: Pixel ratio > 5%
-                                        if fire_pixel_ratio > 0.05:
+                                        # Balance 2: Pixel ratio > 2% (More sensitive, lowered from 5%)
+                                        if fire_pixel_ratio > 0.02:
                                             orig_x1, orig_y1, orig_x2, orig_y2 = int(x1 * scale), int(y1 * scale), int(x2 * scale), int(y2 * scale)
                                             temp_fire_status.append((orig_x1, orig_y1, orig_x2, orig_y2, conf, class_name))
                                             fire_detected_this_frame = True
@@ -469,8 +468,8 @@ def generate_frames(cam_id):
                     else:
                         fire_consecutive_count = 0  
 
-                    # Balance 3: Needs only 3 consecutive frames
-                    if fire_detected_this_frame and fire_consecutive_count >= 3:
+                    # Balance 3: Needs only 1 consecutive frames (More sensitive, lowered from 3)
+                    if fire_detected_this_frame and fire_consecutive_count >= 1:
                         fire_emergency_active = True 
 
                         current_time = time.time()
