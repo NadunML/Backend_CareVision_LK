@@ -106,10 +106,15 @@ maskNet = None
 fire_model = None 
 
 last_log_times = {}
+in_memory_patients = []
+patient_names_cache = {}
 
-# Haar Cascade classifier used for lightweight face detection in mask analysis.
+# Haar Cascade classifiers used for lightweight face and eye detection in mask analysis.
 face_cascade = cv2.CascadeClassifier(
     cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+)
+eye_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + 'haarcascade_eye.xml'
 )
 
 def load_ai_models():
@@ -121,9 +126,23 @@ def load_ai_models():
     model (mask_detector.h5) and the YOLOv8 fire-detection model
     (fire_model.pt) if the respective files are present on disk.
     """
-    global known_face_encodings, known_face_names, maskNet, fire_model
+    global known_face_encodings, known_face_names, maskNet, fire_model, patient_names_cache, in_memory_patients
     known_face_encodings = []
     known_face_names = []
+    patient_names_cache = {}
+    
+    try:
+        conn = mysql.connector.connect(**db_config)
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT patient_id, name FROM patients")
+        for row in cursor.fetchall():
+            patient_names_cache[str(row['patient_id'])] = row['name']
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        print(f"Could not load patient names from DB: {e}")
+        for p in in_memory_patients:
+            patient_names_cache[str(p.get('patient_id', ''))] = p.get('name', 'Unknown')
     
     print("Loading Patient Images...")
     if os.path.exists(UPLOAD_FOLDER):
@@ -351,7 +370,7 @@ def generate_frames(cam_id):
     Yields:
         bytes: A single MJPEG boundary-delimited JPEG frame.
     """
-    global last_log_times, fire_emergency_active
+    global last_log_times, fire_emergency_active, patient_names_cache
     current_src = None
     camera = None
     frame_counter = 0
@@ -444,7 +463,6 @@ def generate_frames(cam_id):
                                 cls_id = int(box.cls[0])
                                 class_name = fire_model.names[cls_id].upper()
 
-                                # Balance 1: Confidence > 45% (More sensitive, lowered from 65%)
                                 if 'FIRE' in class_name and 'SMOKE' not in class_name and conf > 0.45:
                                     x1, y1, x2, y2 = map(int, box.xyxy[0])
                                     
@@ -457,7 +475,6 @@ def generate_frames(cam_id):
                                         
                                         fire_pixel_ratio = np.sum(mask > 0) / (roi.size / 3 + 1e-6)
                                         
-                                        # Balance 2: Pixel ratio > 2% (More sensitive, lowered from 5%)
                                         if fire_pixel_ratio > 0.02:
                                             orig_x1, orig_y1, orig_x2, orig_y2 = int(x1 * scale), int(y1 * scale), int(x2 * scale), int(y2 * scale)
                                             temp_fire_status.append((orig_x1, orig_y1, orig_x2, orig_y2, conf, class_name))
@@ -468,7 +485,6 @@ def generate_frames(cam_id):
                     else:
                         fire_consecutive_count = 0  
 
-                    # Balance 3: Needs only 1 consecutive frames (More sensitive, lowered from 3)
                     if fire_detected_this_frame and fire_consecutive_count >= 1:
                         fire_emergency_active = True 
 
@@ -525,11 +541,14 @@ def generate_frames(cam_id):
                                 alert_key = f"pat_{cam_id}_{name}"
                                 if current_time - last_log_times.get(alert_key, 0) > 20: 
                                     try:
+                                        full_name = patient_names_cache.get(name, name)
+                                        alert_text = f"Patient Wandering - {full_name}"
+                                        
                                         db_conn = mysql.connector.connect(**db_config)
                                         db_cursor = db_conn.cursor()
                                         db_cursor.execute(
                                             "INSERT INTO system_alerts (alert_type, camera_id) VALUES (%s, %s)",
-                                            ('Patient Wandering', f"Cam 0{cam_id}")
+                                            (alert_text, f"Cam 0{cam_id}")
                                         )
                                         db_conn.commit()
                                         db_cursor.close()
@@ -543,48 +562,63 @@ def generate_frames(cam_id):
                 if cam_config['mask'] and not fire_emergency_active:
                     try:
                         gray_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-                        faces = face_cascade.detectMultiScale(gray_small, 1.1, 4)
                         
-                        temp_mask_status = []
-                        for (x, y, w, h) in faces:
-                            orig_x, orig_y, orig_w, orig_h = int(x * scale), int(y * scale), int(w * scale), int(h * scale)
-                            if w < 20 or h < 20: continue
+                        faces = face_cascade.detectMultiScale(gray_small, scaleFactor=1.1, minNeighbors=4)
+                        
+                        if len(faces) == 0:
+                            eyes = eye_cascade.detectMultiScale(gray_small, scaleFactor=1.1, minNeighbors=5)
+                            if len(eyes) > 0:
+                                (ex, ey, ew, eh) = eyes[0]
+                                fx = max(0, ex - int(ew * 1.5))
+                                fy = max(0, ey - int(eh * 1.5))
+                                fw = int(ew * 4.5)
+                                fh = int(eh * 5.5)
+                                faces = [[fx, fy, fw, fh]]
 
-                            no_mask = False
-                            if maskNet is not None:
-                                face_img = small_frame[y:y+h, x:x+w]
-                                if face_img.size > 0:
-                                    face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
-                                    face_img = cv2.resize(face_img, (224, 224))
-                                    face_img = img_to_array(face_img)
-                                    face_img = preprocess_input(face_img)
-                                    face_img = np.expand_dims(face_img, axis=0)
-                                    predictions = maskNet.predict(face_img, verbose=0)[0]
-                                    mask_prob, without_mask_prob = predictions[0], predictions[1]
-                                    no_mask = without_mask_prob > mask_prob
-                                    
-                                    current_time = time.time()
-                                    if current_time - last_log_times.get(cam_id, 0) > 10: 
-                                        mask_det_str = "No" if no_mask else "Yes"
-                                        acc_res_str = "Denied" if no_mask else "Granted"
-                                        try:
-                                            db_conn = mysql.connector.connect(**db_config)
-                                            db_cursor = db_conn.cursor()
-                                            db_cursor.execute("INSERT INTO access_logs (camera_id, mask_detected, access_result) VALUES (%s, %s, %s)", (f"Cam 0{cam_id}", mask_det_str, acc_res_str))
-                                            if no_mask:
-                                                db_cursor.execute("INSERT INTO system_alerts (alert_type, camera_id) VALUES (%s, %s)", ('Mask Violation', f"Cam 0{cam_id}"))
-                                            db_conn.commit()
-                                            db_cursor.close()
-                                            db_conn.close()
-                                            last_log_times[cam_id] = current_time
-                                        except Exception:
-                                            pass
-                            else: 
-                                no_mask = True 
+                        if len(faces) > 0:
+                            temp_mask_status = []
+                            for (x, y, w, h) in faces:
+                                orig_x, orig_y, orig_w, orig_h = int(x * scale), int(y * scale), int(w * scale), int(h * scale)
+                                if w < 20 or h < 20: continue
+
+                                no_mask = False
+                                if maskNet is not None:
+                                    face_img = small_frame[y:y+h, x:x+w]
+                                    if face_img.size > 0:
+                                        face_img = cv2.cvtColor(face_img, cv2.COLOR_BGR2RGB)
+                                        face_img = cv2.resize(face_img, (224, 224))
+                                        face_img = img_to_array(face_img)
+                                        face_img = preprocess_input(face_img)
+                                        face_img = np.expand_dims(face_img, axis=0)
+                                        predictions = maskNet.predict(face_img, verbose=0)[0]
+                                        mask_prob, without_mask_prob = predictions[0], predictions[1]
+                                        no_mask = without_mask_prob > mask_prob
+                                        
+                                        current_time = time.time()
+                                        if current_time - last_log_times.get(cam_id, 0) > 10: 
+                                            mask_det_str = "No" if no_mask else "Yes"
+                                            acc_res_str = "Denied" if no_mask else "Granted"
+                                            try:
+                                                db_conn = mysql.connector.connect(**db_config)
+                                                db_cursor = db_conn.cursor()
+                                                db_cursor.execute("INSERT INTO access_logs (camera_id, mask_detected, access_result) VALUES (%s, %s, %s)", (f"Cam 0{cam_id}", mask_det_str, acc_res_str))
+                                                if no_mask:
+                                                    db_cursor.execute("INSERT INTO system_alerts (alert_type, camera_id) VALUES (%s, %s)", ('Mask Violation', f"Cam 0{cam_id}"))
+                                                db_conn.commit()
+                                                db_cursor.close()
+                                                db_conn.close()
+                                                last_log_times[cam_id] = current_time
+                                            except Exception:
+                                                pass
+                                else: 
+                                    no_mask = True 
                                 
-                            temp_mask_status.append((orig_x, orig_y, orig_w, orig_h, no_mask))
+                                temp_mask_status.append((orig_x, orig_y, orig_w, orig_h, no_mask))
                             
-                        last_mask_status = temp_mask_status
+                            last_mask_status = temp_mask_status
+                        else:
+                            last_mask_status = []
+                                
                     except Exception:
                         pass
 
@@ -708,7 +742,6 @@ async def get_cameras():
     """Return the currently configured stream URL for all cameras."""
     return camera_urls
 
-in_memory_patients = []
 
 @app.post("/api/register-patient")
 async def register_patient(
