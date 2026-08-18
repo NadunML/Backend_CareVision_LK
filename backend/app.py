@@ -1,29 +1,9 @@
-"""
-CareVision LK - Backend API Server
-====================================
-FastAPI-based backend providing real-time AI surveillance capabilities
-including patient wandering detection, mask compliance monitoring,
-fire detection, and patient registration management.
+# CareVision LK Backend API Server
 
-AI Models:
-    - Face Recognition (dlib): Patient identification
-    - MobileNetV2 (TensorFlow/Keras): Mask detection
-    - YOLOv8 (Ultralytics): Fire detection
-
-Database credentials are loaded from a .env file via python-dotenv.
-"""
-
-# ---------------------------------------------------------------------------
-# Standard library imports
-# ---------------------------------------------------------------------------
 import os
 import threading
 import time
 from datetime import datetime
-
-# ---------------------------------------------------------------------------
-# Third-party imports
-# ---------------------------------------------------------------------------
 import cv2
 import face_recognition
 import mysql.connector
@@ -37,13 +17,11 @@ from pydantic import BaseModel
 from ultralytics import YOLO
 from werkzeug.utils import secure_filename
 
-# Load environment variables from .env before any configuration is read
 load_dotenv()
 
 os.environ["TF_USE_LEGACY_KERAS"] = "1"
 
-# Attempt to import TensorFlow Keras from the standalone tf_keras package
-# (preferred for compatibility), falling back to the bundled tensorflow.keras.
+# Try loading keras based on availability
 try:
     from tf_keras.applications.mobilenet_v2 import preprocess_input
     from tf_keras.preprocessing.image import img_to_array
@@ -59,9 +37,6 @@ except ImportError:
         print("WARNING: TensorFlow is not installed. Mask detection will be unavailable.")
         TF_AVAILABLE = False
 
-# ---------------------------------------------------------------------------
-# Application Setup
-# ---------------------------------------------------------------------------
 UPLOAD_FOLDER = 'uploads'
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
@@ -84,13 +59,13 @@ db_config = {
     'database': os.getenv('DB_NAME', 'carevision_db')
 }
 
-# Industry Standard: Validate connection instead of auto-creating schema at runtime
+# Check db connection on startup
 try:
     conn = mysql.connector.connect(**db_config)
     conn.close()
-    print("✅ Successfully connected to the database!")
+    print("Successfully connected to the database.")
 except Exception as e:
-    print(f"❌ Database Connection Error: {e}")
+    print(f"Database Connection Error: {e}")
 
 camera_ai_configs = {
     str(i): {'patient': False, 'mask': False, 'fire': False} for i in range(1, 10)
@@ -98,7 +73,8 @@ camera_ai_configs = {
 
 fire_emergency_active = False
 
-camera_urls = {'1': '0', '2': '', '3': '', '4': '', '5': '', '6': '', '7': '', '8': '', '9': ''}
+# Initialized empty so no camera turns on automatically
+camera_urls = {'1': '', '2': '', '3': '', '4': '', '5': '', '6': '', '7': '', '8': '', '9': ''}
 
 known_face_encodings = []
 known_face_names = []
@@ -109,23 +85,11 @@ last_log_times = {}
 in_memory_patients = []
 patient_names_cache = {}
 
-# Haar Cascade classifiers used for lightweight face and eye detection in mask analysis.
-face_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-)
-eye_cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + 'haarcascade_eye.xml'
-)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
+eye_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_eye.xml')
 
 def load_ai_models():
-    """
-    Load all AI models and patient face encodings into memory.
-
-    Scans the uploads/ directory to build face encoding vectors for every
-    registered patient image. Also loads the MobileNetV2 mask-detection
-    model (mask_detector.h5) and the YOLOv8 fire-detection model
-    (fire_model.pt) if the respective files are present on disk.
-    """
+    # Load patient encodings and ai models
     global known_face_encodings, known_face_names, maskNet, fire_model, patient_names_cache, in_memory_patients
     known_face_encodings = []
     known_face_names = []
@@ -156,43 +120,30 @@ def load_ai_models():
                     if len(encodings) > 0:
                         known_face_encodings.append(encodings[0])
                         known_face_names.append(patient_id)
-                except Exception as e:
+                except Exception:
                     pass
     
     if TF_AVAILABLE and os.path.exists("mask_detector.h5"):
         print("Loading Deep Learning Mask Model (MobileNetV2)...")
         try:
             maskNet = load_model("mask_detector.h5")
-            print("✅ Modern Mask AI Loaded Successfully!")
-        except Exception as e:
+            print("Mask AI loaded successfully.")
+        except Exception:
             pass
 
     if os.path.exists("fire_model.pt"):
         print("Loading YOLOv8 Fire Detection Model...")
         try:
             fire_model = YOLO("fire_model.pt")
-            print("✅ Modern Fire AI (YOLOv8) Loaded Successfully!")
-        except Exception as e:
+            print("Fire AI loaded successfully.")
+        except Exception:
             pass
 
 load_ai_models()
 
 class ThreadedCamera:
-    """
-    A thread-safe video capture wrapper with automatic reconnection.
-
-    Reads frames from a camera source (device index or URL) on a background
-    daemon thread, exposing the latest frame via the read() method. If the
-    stream drops, the thread attempts to reopen the capture every 2 seconds.
-    """
-
+    # Handles continuous camera reading in a background thread
     def __init__(self, src):
-        """
-        Initialise the camera and attempt the first capture open.
-
-        Args:
-            src (int | str): Device index (int) or stream URL (str).
-        """
         self.src = src
         self.capture = None
         self.status = False
@@ -202,12 +153,6 @@ class ThreadedCamera:
         self._open_capture()
 
     def _open_capture(self):
-        """
-        Open (or reopen) the cv2.VideoCapture for this source.
-
-        For integer sources, DirectShow (CAP_DSHOW) is tried first on Windows
-        for lower-latency capture; a generic backend is used as a fallback.
-        """
         try:
             if self.capture is not None:
                 try:
@@ -232,7 +177,6 @@ class ThreadedCamera:
             self.status = False
 
     def start(self):
-        """Start the background reader thread. Returns self to allow chaining."""
         if self.started:
             return self
         self.started = True
@@ -241,13 +185,6 @@ class ThreadedCamera:
         return self
 
     def update(self):
-        """
-        Background thread loop: continuously reads frames and handles reconnection.
-
-        For local file sources that reach EOF, the stream is rewound.
-        For network/RTSP sources, the capture is fully reopened after a
-        failed read if the reconnection cooldown (2 s) has elapsed.
-        """
         last_reconnect = time.time()
         while self.started:
             if self.capture is None or not self.capture.isOpened():
@@ -264,6 +201,7 @@ class ThreadedCamera:
                 self.frame = frame
             else:
                 self.status = False
+                # Reconnect logic if stream drops
                 if isinstance(self.src, str) and not (self.src.startswith("http://") or self.src.startswith("https://") or self.src.startswith("rtsp://")):
                     try:
                         self.capture.set(cv2.CAP_PROP_POS_FRAMES, 0)
@@ -276,11 +214,9 @@ class ThreadedCamera:
                 time.sleep(0.03)
 
     def read(self):
-        """Return the latest (status, frame) tuple captured by the thread."""
         return self.status, self.frame
 
     def stop(self):
-        """Signal the reader thread to exit and release the capture device."""
         self.started = False
         if self.thread:
             self.thread.join(timeout=1.0)
@@ -290,32 +226,13 @@ class ThreadedCamera:
             except Exception:
                 pass
 
-
 class CameraRegistry:
-    """
-    Thread-safe registry that manages shared ThreadedCamera instances.
-
-    Multiple consumers (e.g. different AI pipeline calls) may share the same
-    physical camera. The registry uses reference counting so that the
-    underlying capture is only released when all consumers have called
-    release_camera().
-    """
-
+    # Manages shared camera instances
     def __init__(self):
-        """Initialise the registry with an empty camera table and a mutex."""
         self.lock = threading.Lock()
         self.cameras = {}
 
     def get_camera(self, src):
-        """
-        Retrieve an existing camera for *src* or create and start a new one.
-
-        Args:
-            src (int | str): The camera source identifier.
-
-        Returns:
-            ThreadedCamera: The shared camera instance for this source.
-        """
         with self.lock:
             if src in self.cameras:
                 self.cameras[src]['ref_count'] += 1
@@ -329,15 +246,6 @@ class CameraRegistry:
                 return camera
 
     def release_camera(self, src):
-        """
-        Decrement the reference count for *src*.
-
-        When the count reaches zero the camera is stopped and removed from
-        the registry.
-
-        Args:
-            src (int | str): The camera source identifier to release.
-        """
         with self.lock:
             if src in self.cameras:
                 self.cameras[src]['ref_count'] -= 1
@@ -349,27 +257,7 @@ class CameraRegistry:
 camera_registry = CameraRegistry()
 
 def generate_frames(cam_id):
-    """
-    Generator that yields MJPEG frames for a given camera, with AI overlays.
-
-    This is the core streaming pipeline. On each iteration it:
-      1. Checks whether the camera URL is configured; serves a 'NO SIGNAL'
-         placeholder frame if not.
-      2. Reads the latest frame from the shared ThreadedCamera instance,
-         serving a 'CONNECTING' placeholder on failure.
-      3. Every 5 frames: runs hybrid YOLOv8 + HSV fire detection.
-      4. Every 30 frames: runs face recognition (patient ID) and
-         MobileNetV2 mask compliance detection.
-      5. Draws bounding-box overlays and alert banners onto the frame.
-      6. JPEG-encodes the frame and yields it as a multipart/x-mixed-replace
-         boundary for the browser's img tag.
-
-    Args:
-        cam_id (str): The camera identifier key (e.g. '1', '2', ... '5').
-
-    Yields:
-        bytes: A single MJPEG boundary-delimited JPEG frame.
-    """
+    # Main video pipeline with AI processing
     global last_log_times, fire_emergency_active, patient_names_cache
     current_src = None
     camera = None
@@ -396,8 +284,7 @@ def generate_frames(cam_id):
                 cv2.putText(blank_frame, f"CAM 0{cam_id}: NO SIGNAL", (180, 220), cv2.FONT_HERSHEY_DUPLEX, 0.8, (100, 100, 100), 2)
                 cv2.putText(blank_frame, "Configure URL in Settings", (170, 260), cv2.FONT_HERSHEY_DUPLEX, 0.6, (70, 70, 70), 1)
                 ret, buffer = cv2.imencode('.jpg', blank_frame)
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
                 time.sleep(0.2)
                 continue
 
@@ -417,8 +304,7 @@ def generate_frames(cam_id):
                 blank_frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(blank_frame, f"CAM 0{cam_id}: CONNECTING...", (160, 240), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 165, 255), 2)
                 ret, buffer = cv2.imencode('.jpg', blank_frame)
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+                yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
                 time.sleep(0.1)
                 continue
                 
@@ -446,9 +332,7 @@ def generate_frames(cam_id):
             target_w = min(w, 320)
             scale = w / max(target_w, 1)
             
-            # -------------------------------------------------------------
-            # 1. HYBRID FIRE DETECTION LOGIC (HIGH SENSITIVITY)
-            # -------------------------------------------------------------
+            # Fire detection
             if cam_config['fire'] and frame_counter % 5 == 0:
                 small_frame_fire = cv2.resize(frame, (target_w, int(h / max(scale, 1e-6))))
                 try:
@@ -494,14 +378,8 @@ def generate_frames(cam_id):
                             try:
                                 db_conn = mysql.connector.connect(**db_config)
                                 db_cursor = db_conn.cursor()
-                                db_cursor.execute(
-                                    "INSERT INTO fire_logs (camera_id, status) VALUES (%s, 'Active')",
-                                    (f"Cam 0{cam_id}",)
-                                )
-                                db_cursor.execute(
-                                    "INSERT INTO system_alerts (alert_type, camera_id) VALUES (%s, %s)",
-                                    ('Fire', f"Cam 0{cam_id}")
-                                )
+                                db_cursor.execute("INSERT INTO fire_logs (camera_id, status) VALUES (%s, 'Active')", (f"Cam 0{cam_id}",))
+                                db_cursor.execute("INSERT INTO system_alerts (alert_type, camera_id) VALUES (%s, %s)", ('Fire', f"Cam 0{cam_id}"))
                                 db_conn.commit()
                                 db_cursor.close()
                                 db_conn.close()
@@ -513,9 +391,7 @@ def generate_frames(cam_id):
                 except Exception:
                     pass
 
-            # -------------------------------------------------------------
-            # 2. PATIENT & MASK DETECTION LOGIC
-            # -------------------------------------------------------------
+            # Patient and mask detection
             if frame_counter % 30 == 0:
                 small_frame = cv2.resize(frame, (target_w, int(h / max(scale, 1e-6))))
 
@@ -546,10 +422,7 @@ def generate_frames(cam_id):
                                         
                                         db_conn = mysql.connector.connect(**db_config)
                                         db_cursor = db_conn.cursor()
-                                        db_cursor.execute(
-                                            "INSERT INTO system_alerts (alert_type, camera_id) VALUES (%s, %s)",
-                                            (alert_text, f"Cam 0{cam_id}")
-                                        )
+                                        db_cursor.execute("INSERT INTO system_alerts (alert_type, camera_id) VALUES (%s, %s)", (alert_text, f"Cam 0{cam_id}"))
                                         db_conn.commit()
                                         db_cursor.close()
                                         db_conn.close()
@@ -562,7 +435,6 @@ def generate_frames(cam_id):
                 if cam_config['mask'] and not fire_emergency_active:
                     try:
                         gray_small = cv2.cvtColor(small_frame, cv2.COLOR_BGR2GRAY)
-                        
                         faces = face_cascade.detectMultiScale(gray_small, scaleFactor=1.1, minNeighbors=4)
                         
                         if len(faces) == 0:
@@ -622,9 +494,7 @@ def generate_frames(cam_id):
                     except Exception:
                         pass
 
-            # -------------------------------------------------------------
-            # 3. DRAWING OVERLAYS ON FRAME
-            # -------------------------------------------------------------
+            # Draw UI overlays
             if cam_config['patient'] and not fire_emergency_active:
                 for (top, right, bottom, left), name in zip(last_face_locations, last_face_names):
                     t, r, b, l = int(top * scale), int(right * scale), int(bottom * scale), int(left * scale)
@@ -655,9 +525,7 @@ def generate_frames(cam_id):
 
             ret, buffer = cv2.imencode('.jpg', frame)
             frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            
+            yield (b'--frame\r\n' b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
             time.sleep(0.04)
 
     finally:
@@ -665,37 +533,23 @@ def generate_frames(cam_id):
             camera_registry.release_camera(current_src) 
 
 class AIConfigUpdate(BaseModel):
-    """
-    Request body schema for toggling an AI module on a specific camera.
-    """
     camId: str
     module: str
     status: bool
 
 class LoginHistoryRequest(BaseModel):
-    """
-    Request body schema for saving login history.
-    """
     email: str
-
-# --- API ENDPOINTS ---
 
 @app.get("/")
 async def root():
-    """Health check endpoint. Returns a simple operational status message."""
     return {"status": "Backend & AI Operational"}
 
 @app.get("/video_feed/{cam_id}")
 async def video_feed(cam_id: str):
-    """Stream MJPEG video with AI overlays for the specified camera."""
-    return StreamingResponse(
-        generate_frames(cam_id),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
+    return StreamingResponse(generate_frames(cam_id), media_type="multipart/x-mixed-replace; boundary=frame")
 
 @app.post("/api/set_camera_ai")
 async def set_camera_ai(config: AIConfigUpdate):
-    """Enable or disable a specific AI module for a given camera."""
     global camera_ai_configs
     if config.camId in camera_ai_configs and config.module in camera_ai_configs[config.camId]:
         camera_ai_configs[config.camId][config.module] = config.status
@@ -704,7 +558,6 @@ async def set_camera_ai(config: AIConfigUpdate):
 
 @app.post("/api/disable_non_fire")
 async def disable_non_fire():
-    """Disable patient and mask modules across all cameras (used during fire lockdown)."""
     global camera_ai_configs
     for cam in camera_ai_configs:
         camera_ai_configs[cam].update({'patient': False, 'mask': False})
@@ -712,36 +565,37 @@ async def disable_non_fire():
 
 @app.get("/api/get_camera_ai")
 async def get_camera_ai():
-    """Return the current AI module configuration for all cameras."""
     return camera_ai_configs
 
 @app.get("/api/emergency-status")
 async def get_emergency_status():
-    """Return whether the global fire emergency lockdown is currently active."""
     global fire_emergency_active
     return {"emergency_lockdown": fire_emergency_active}
 
 @app.get("/api/get_modes")
 async def get_modes():
-    """Return AI mode configuration for camera 1 (legacy compatibility endpoint)."""
     return camera_ai_configs.get('1', {})
 
 @app.post("/toggle_mode/{feature}")
 async def toggle_mode(feature: str):
-    """Legacy mode toggle stub retained for frontend compatibility."""
     return {"status": "success"}
 
 @app.post("/api/update_camera")
 async def update_camera(cam_id: str = Form(...), url: str = Form(default="")):
-    """Update the stream URL for a given camera at runtime."""
     camera_urls[cam_id] = url
     return {"status": "success", "camera": cam_id, "url": url}
 
 @app.get("/api/get_cameras")
 async def get_cameras():
-    """Return the currently configured stream URL for all cameras."""
     return camera_urls
 
+@app.post("/api/disconnect_all_cameras")
+async def disconnect_all_cameras():
+    # Disconnects all cameras when requested (e.g., on user logout)
+    global camera_urls
+    for cam_id in camera_urls:
+        camera_urls[cam_id] = ""
+    return {"status": "success", "message": "All cameras disconnected"}
 
 @app.post("/api/register-patient")
 async def register_patient(
@@ -752,7 +606,6 @@ async def register_patient(
     riskLevel: str = Form(default=""),
     image: UploadFile = File(...)
 ):
-    """Register a new patient with a facial reference image."""
     global in_memory_patients
     try:
         filename = secure_filename(f"{patientId}_{image.filename}")
@@ -790,7 +643,6 @@ async def register_patient(
 
 @app.get("/api/patients")
 async def get_patients():
-    """Retrieve all registered patients ordered by most recent registration."""
     try:
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor(dictionary=True) 
@@ -807,7 +659,6 @@ async def get_patients():
 
 @app.delete("/api/delete-patient/{patient_id}")
 async def delete_patient(patient_id: str):
-    """Delete a patient record by patient ID."""
     global in_memory_patients
     try:
         try:
@@ -828,7 +679,6 @@ async def delete_patient(patient_id: str):
 
 @app.get("/api/access_logs")
 async def get_access_logs():
-    """Return the 50 most recent mask-access log entries, newest first."""
     try:
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor(dictionary=True) 
@@ -839,32 +689,26 @@ async def get_access_logs():
         cursor.close()
         conn.close()
         return logs
-    except Exception as e:
+    except Exception:
         return []
 
 @app.get("/api/fire_logs")
 async def get_fire_logs():
-    """Return the 50 most recent fire detection log entries, newest first."""
     try:
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor(dictionary=True)
-        cursor.execute(
-            "SELECT id, camera_id, status, timestamp "
-            "FROM fire_logs "
-            "ORDER BY timestamp DESC LIMIT 50"
-        )
+        cursor.execute("SELECT id, camera_id, status, timestamp FROM fire_logs ORDER BY timestamp DESC LIMIT 50")
         logs = cursor.fetchall()
         for log in logs:
             log['timestamp'] = str(log['timestamp'])
         cursor.close()
         conn.close()
         return logs
-    except Exception as e:
+    except Exception:
         return []
 
 @app.post("/api/resolve_fire_alert/{log_id}")
 async def resolve_fire_alert(log_id: int):
-    """Mark a fire log entry as resolved and clear the emergency lockdown if appropriate."""
     global fire_emergency_active
     try:
         conn = mysql.connector.connect(**db_config)
@@ -877,7 +721,6 @@ async def resolve_fire_alert(log_id: int):
             cursor.execute("UPDATE system_alerts SET status = 'Resolved' WHERE camera_id = %s AND alert_type = 'Fire' AND status = 'Pending'", (log['camera_id'],))
             
         conn.commit()
-
         cursor.execute("SELECT COUNT(*) as cnt FROM fire_logs WHERE status = 'Active'")
         remaining = cursor.fetchone()
         if remaining and remaining['cnt'] == 0:
@@ -886,12 +729,11 @@ async def resolve_fire_alert(log_id: int):
         cursor.close()
         conn.close()
         return {"status": "success"}
-    except Exception as e:
+    except Exception:
         return {"status": "error"}
 
 @app.get("/api/system_alerts")
 async def get_system_alerts():
-    """Return the 50 most recent system alert entries across all alert types, newest first."""
     try:
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor(dictionary=True) 
@@ -902,12 +744,11 @@ async def get_system_alerts():
         cursor.close()
         conn.close()
         return logs
-    except Exception as e:
+    except Exception:
         return []
 
 @app.post("/api/resolve_system_alert/{alert_id}")
 async def resolve_system_alert(alert_id: int):
-    """Resolve a system alert by ID and propagate the resolution to related records."""
     global fire_emergency_active
     try:
         conn = mysql.connector.connect(**db_config)
@@ -921,7 +762,6 @@ async def resolve_system_alert(alert_id: int):
                 cursor.execute("UPDATE fire_logs SET status = 'Resolved' WHERE camera_id = %s AND status = 'Active'", (alert['camera_id'],))
         
         conn.commit()
-
         cursor.execute("SELECT COUNT(*) as cnt FROM fire_logs WHERE status = 'Active'")
         remaining = cursor.fetchone()
         if remaining and remaining['cnt'] == 0:
@@ -930,14 +770,11 @@ async def resolve_system_alert(alert_id: int):
         cursor.close()
         conn.close()
         return {"status": "success"}
-    except Exception as e:
+    except Exception:
         return {"status": "error"}
-
-# --- NEW LOGIN HISTORY ENDPOINTS ---
 
 @app.post("/api/login-history")
 async def save_login_history(req: LoginHistoryRequest):
-    """Save a new successful login record."""
     try:
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor()
@@ -951,7 +788,6 @@ async def save_login_history(req: LoginHistoryRequest):
 
 @app.get("/api/login-history")
 async def get_login_history():
-    """Retrieve the 50 most recent login records."""
     try:
         conn = mysql.connector.connect(**db_config)
         cursor = conn.cursor(dictionary=True)
@@ -962,7 +798,7 @@ async def get_login_history():
         cursor.close()
         conn.close()
         return records
-    except Exception as e:
+    except Exception:
         return []
 
 if __name__ == "__main__":
