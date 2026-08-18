@@ -494,7 +494,7 @@ def generate_frames(cam_id):
                     except Exception:
                         pass
 
-            # Draw UI overlays
+            #  UI overlays
             if cam_config['patient'] and not fire_emergency_active:
                 for (top, right, bottom, left), name in zip(last_face_locations, last_face_names):
                     t, r, b, l = int(top * scale), int(right * scale), int(bottom * scale), int(left * scale)
@@ -503,7 +503,6 @@ def generate_frames(cam_id):
                         cv2.putText(frame, f"PT {name}", (l + 6, b - 6), cv2.FONT_HERSHEY_DUPLEX, 0.6, (0, 0, 255), 2)
                     else:
                         cv2.rectangle(frame, (l, t), (r, b), (0, 255, 0), 2)
-                        cv2.putText(frame, "Staff", (l + 6, b - 6), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 0), 1)
 
             if cam_config['mask'] and not fire_emergency_active:
                 for (x, y, w, h, no_mask) in last_mask_status:
@@ -606,7 +605,7 @@ async def register_patient(
     riskLevel: str = Form(default=""),
     image: UploadFile = File(...)
 ):
-    global in_memory_patients
+    global in_memory_patients, known_face_encodings, known_face_names, patient_names_cache
     try:
         filename = secure_filename(f"{patientId}_{image.filename}")
         filepath = os.path.join(UPLOAD_FOLDER, filename)
@@ -632,14 +631,24 @@ async def register_patient(
             cursor.close()
             conn.close()
         except Exception as db_err:
-            print(f"MySQL store warning (using memory fallback): {db_err}")
             in_memory_patients = [p for p in in_memory_patients if p.get('patient_id') != patientId]
             in_memory_patients.insert(0, patient_record)
 
-        load_ai_models() 
+        # Update AI Memory instantly without restarting full AI models
+        patient_names_cache[str(patientId)] = name
+        try:
+            new_image = face_recognition.load_image_file(filepath)
+            encodings = face_recognition.face_encodings(new_image)
+            if len(encodings) > 0:
+                known_face_encodings.append(encodings[0])
+                known_face_names.append(patientId)
+        except Exception:
+            pass
+
         return {"status": "success", "message": "Patient registered successfully!"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
 
 @app.get("/api/patients")
 async def get_patients():
@@ -659,8 +668,9 @@ async def get_patients():
 
 @app.delete("/api/delete-patient/{patient_id}")
 async def delete_patient(patient_id: str):
-    global in_memory_patients
+    global in_memory_patients, known_face_encodings, known_face_names
     try:
+        # 1. Delete from Database
         try:
             conn = mysql.connector.connect(**db_config)
             cursor = conn.cursor()
@@ -671,8 +681,24 @@ async def delete_patient(patient_id: str):
         except Exception:
             pass
 
+        # 2. Clear from fallback memory
         in_memory_patients = [p for p in in_memory_patients if p.get('patient_id') != patient_id]
-        load_ai_models() 
+
+        # 3. Force delete ALL image files belonging to this patient
+        if os.path.exists(UPLOAD_FOLDER):
+            for filename in os.listdir(UPLOAD_FOLDER):
+                if filename.startswith(f"{patient_id}_"):
+                    filepath = os.path.join(UPLOAD_FOLDER, filename)
+                    try:
+                        os.remove(filepath)
+                    except Exception:
+                        pass
+
+        # 4. INSTANTLY remove the face from AI active memory tracking
+        indices_to_keep = [i for i, name in enumerate(known_face_names) if name != patient_id]
+        known_face_encodings = [known_face_encodings[i] for i in indices_to_keep]
+        known_face_names = [known_face_names[i] for i in indices_to_keep]
+
         return {"status": "success", "message": "Patient deleted successfully!"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
